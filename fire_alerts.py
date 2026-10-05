@@ -26,8 +26,10 @@ import io
 import json
 import logging
 import os
+import struct
 import sys
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -198,11 +200,118 @@ def _pick_field(columns, override, candidates, what):
                      f"Set the {what.upper()}_FIELD environment variable.")
 
 
+# --------------------------------------------------------------------------- #
+# TOLERANT SHAPEFILE READER
+# Some ward polygons in the district shapefile have rings that are not closed.
+# GDAL passes them on as-is and shapely refuses them. This pure-Python reader
+# closes the rings itself, so no extra libraries are needed.
+# --------------------------------------------------------------------------- #
+def _shapefile_bytes(path: Path) -> dict:
+    """Return {'shp':bytes,'dbf':bytes} from a .shp path or a .zip containing one."""
+    if path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(path) as zf:
+            names = {Path(n).suffix.lower(): n for n in zf.namelist() if not n.startswith("__MACOSX")}
+            return {"shp": zf.read(names[".shp"]), "dbf": zf.read(names[".dbf"])}
+    return {"shp": path.with_suffix(".shp").read_bytes(), "dbf": path.with_suffix(".dbf").read_bytes()}
+
+
+def _parse_dbf(buf: bytes) -> list:
+    """Attribute table -> list of dicts (None for rows flagged as deleted)."""
+    nrec, hlen, rlen = struct.unpack("<IHH", buf[4:12])
+    fields, pos = [], 32
+    while buf[pos] != 0x0D:
+        fields.append((buf[pos:pos + 11].split(b"\0")[0].decode("latin1"), buf[pos + 16]))
+        pos += 32
+    rows = []
+    for i in range(nrec):
+        rec = buf[hlen + i * rlen: hlen + (i + 1) * rlen]
+        if rec[:1] == b"*":
+            rows.append(None)
+            continue
+        off, row = 1, {}
+        for name, ln in fields:
+            row[name] = rec[off:off + ln].decode("latin1").strip()
+            off += ln
+        rows.append(row)
+    return rows
+
+
+def _parse_shp_polygons(buf: bytes) -> list:
+    """Geometry records -> list of ring lists (numpy Nx2 arrays); None for null shapes."""
+    out, pos = [], 100
+    while pos + 8 <= len(buf):
+        clen = struct.unpack(">ii", buf[pos:pos + 8])[1]
+        content = buf[pos + 8: pos + 8 + clen * 2]
+        pos += 8 + clen * 2
+        stype = struct.unpack("<i", content[:4])[0]
+        if stype == 0:
+            out.append(None)
+            continue
+        if stype not in (5, 15, 25):
+            raise ValueError(f"Shapefile contains non-polygon shape type {stype}")
+        nparts, npts = struct.unpack("<ii", content[36:44])
+        parts = list(struct.unpack(f"<{nparts}i", content[44:44 + 4 * nparts])) + [npts]
+        off = 44 + 4 * nparts
+        xy = np.frombuffer(content, dtype="<f8", count=2 * npts, offset=off).reshape(-1, 2)
+        out.append([xy[a:b] for a, b in zip(parts[:-1], parts[1:])])
+    return out
+
+
+def _read_shapefile_tolerant(path: Path) -> gpd.GeoDataFrame:
+    from shapely import make_valid
+    from shapely.geometry import LinearRing, Polygon
+    from shapely.ops import unary_union
+
+    raw = _shapefile_bytes(path)
+    attrs, shapes = _parse_dbf(raw["dbf"]), _parse_shp_polygons(raw["shp"])
+    rows, geoms, closed_fixed = [], [], 0
+    for a, rings in zip(attrs, shapes):
+        if a is None or not rings:
+            continue
+        shells, holes = [], []
+        for r in rings:
+            if len(r) < 3:
+                continue
+            if not np.array_equal(r[0], r[-1]):
+                r = np.vstack([r, r[:1]])                 # close the ring
+                closed_fixed += 1
+            if len(r) < 4:
+                continue
+            try:
+                lr = LinearRing(r)
+                poly = make_valid(Polygon(lr))
+            except ValueError:
+                continue
+            (holes if lr.is_ccw else shells).append(poly)   # shapefile: clockwise = outer ring
+        if not shells:
+            shells, holes = holes, []
+        if not shells:
+            continue
+        g = unary_union(shells)
+        if holes:
+            g = g.difference(unary_union(holes))
+        rows.append(a)
+        geoms.append(make_valid(g))
+    log.info("Tolerant reader: %d polygons read, %d unclosed rings repaired.", len(geoms), closed_fixed)
+    return gpd.GeoDataFrame(rows, geometry=geoms, crs=4326)
+
+
+def read_boundaries(path: Path) -> gpd.GeoDataFrame:
+    """Normal GDAL read first; fall back to the tolerant reader for .shp/.zip on failure."""
+    try:
+        return gpd.read_file(path)
+    except Exception as exc:
+        if path.suffix.lower() in (".shp", ".zip"):
+            log.warning("Standard reader failed (%s) - using tolerant shapefile reader.", str(exc)[:150])
+            return _read_shapefile_tolerant(path)
+        raise
+
+
 def load_districts() -> gpd.GeoDataFrame:
     """Read the district file, standardise columns, add a centroid for direction maths."""
     if not DISTRICTS_FILE.exists():
         raise SystemExit(f"District file not found: {DISTRICTS_FILE}")
-    gdf = gpd.read_file(DISTRICTS_FILE)
+    gdf = read_boundaries(DISTRICTS_FILE)
     if gdf.crs is None:
         log.warning("District file has no CRS - assuming EPSG:4326.")
         gdf = gdf.set_crs(4326)
