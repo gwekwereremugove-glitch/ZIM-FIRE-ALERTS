@@ -1,0 +1,63 @@
+name: Wildfire alerts
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (print messages, send nothing, don't save state)"
+        type: boolean
+        default: true
+      baseline:
+        description: "Baseline (mark current fires as seen WITHOUT alerting)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fire-alerts
+  cancel-in-progress: false
+
+jobs:
+  check-fires:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Check FIRMS and send alerts
+        env:
+          FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_SMS_FROM: ${{ secrets.TWILIO_SMS_FROM }}
+          TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STAKEHOLDERS_JSON: ${{ secrets.STAKEHOLDERS_JSON }}
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+          BASELINE: ${{ github.event.inputs.baseline == 'true' && '1' || '0' }}
+        run: python fire_alerts.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name  "fire-alert-bot"
+          git config user.email "fire-alert-bot@users.noreply.github.com"
+          git add state/alerted.json
+          if git diff --cached --quiet; then
+            echo "State unchanged - nothing to commit."
+          else
+            git commit -m "Update alert state [skip ci]"
+            git pull --rebase
+            git push
+          fi
