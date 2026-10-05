@@ -50,7 +50,7 @@ def _find_districts_file() -> Path:
     env = os.getenv("DISTRICTS_FILE")
     if env:
         return Path(env)
-   for name in ("districts_simplified.geojson", "zimbabwe_districts.geojson", "Districts.zip", "Districts.shp"):
+    for name in ("districts_simplified.geojson", "zimbabwe_districts.geojson", "Districts.zip", "Districts.shp"):
         if (ROOT / "data" / name).exists():
             return ROOT / "data" / name
     return ROOT / "data" / "Districts.shp"
